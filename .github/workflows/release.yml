@@ -61,8 +61,11 @@ jobs:
       - name: Find generated .deb
         id: find_deb
         run: |
-          # Ищем пакет, собранный CPack для нового имени пакета "async"
-          DEB_PATH=$(find build -maxdepth 1 -name "async-0.1.*.deb" | head -n1)
+          DEB_PATH=$(find build -maxdepth 1 -name "*.deb" | head -n1)
+          if [ -z "$DEB_PATH" ]; then
+            echo "Не удалось найти .deb пакет в директории build" >&2
+            exit 1
+          fi
           DEB_FILE=$(basename "$DEB_PATH")
           echo "deb_path=$DEB_PATH" >> $GITHUB_OUTPUT
           echo "deb_file=$DEB_FILE" >> $GITHUB_OUTPUT
