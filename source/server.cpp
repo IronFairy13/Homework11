@@ -1,110 +1,179 @@
-#include <boost/asio.hpp>
+#include "join_server/server.hpp"
+
+#include "join_server/command.hpp"
+#include "join_server/tables.hpp"
+
+#include <arpa/inet.h>
+#include <cerrno>
+#include <cstring>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 #include <iostream>
 #include <memory>
-#include <array>
+#include <stdexcept>
+#include <string>
+#include <thread>
 
-#include "async/async.h"
-
-using boost::asio::ip::tcp;
-
-class Session : public std::enable_shared_from_this<Session>
+namespace
 {
-public:
-  Session(tcp::socket socket, std::size_t bulk_size)
-      : socket_(std::move(socket)), bulk_size_(bulk_size)
-  {
-  }
 
-  void start()
-  {
-    handle_ = async::connect(bulk_size_);
-    do_read();
-  }
+constexpr int kBacklog = 16;
+constexpr std::size_t kBufferSize = 4096;
 
-private:
-  void do_read()
-  {
-    auto self = shared_from_this();
-    socket_.async_read_some(
-        boost::asio::buffer(buf_),
-        [this, self](boost::system::error_code ec, std::size_t bytes)
-        {
-          if (!ec)
-          {
-            if (bytes > 0)
-              async::receive(handle_, buf_.data(), bytes);
-            do_read();
-          }
-          else
-          {
-            if (handle_)
-            {
-              async::disconnect(handle_);
-              handle_ = nullptr;
-            }
-            boost::system::error_code ignore;
-            socket_.shutdown(tcp::socket::shutdown_both, ignore);
-            socket_.close(ignore);
-          }
-        });
-  }
+} // namespace
 
-  tcp::socket socket_;
-  async::handle_t handle_{nullptr};
-  std::size_t bulk_size_{};
-  std::array<char, 4096> buf_{};
-};
-
-class Server
+namespace join_server
 {
-public:
-  Server(boost::asio::io_context &io, unsigned short port, std::size_t bulk)
-      : acceptor_(io, tcp::endpoint(tcp::v4(), port)), bulk_size_(bulk)
-  {
-    do_accept();
-  }
 
-private:
-  void do_accept()
-  {
-    acceptor_.async_accept(
-        [this](boost::system::error_code ec, tcp::socket socket)
-        {
-          if (!ec)
-          {
-            std::make_shared<Session>(std::move(socket), bulk_size_)->start();
-          }
-          do_accept();
-        });
-  }
-
-  tcp::acceptor acceptor_;
-  std::size_t bulk_size_{};
-};
-
-int main(int argc, char *argv[])
+TcpServer::TcpServer(uint16_t port, std::shared_ptr<TablesStore> store)
+    : port_(port), store_(std::move(store))
 {
-  if (argc != 3)
+  if (!store_)
+    throw std::invalid_argument("TablesStore pointer must not be null");
+
+  listener_ = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (listener_ < 0)
+    throw std::runtime_error(std::string("socket failed: ") + std::strerror(errno));
+
+  int opt = 1;
+  ::setsockopt(listener_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_ANY);
+  addr.sin_port = htons(port_);
+
+  if (::bind(listener_, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0)
   {
-    std::cerr << "Usage: bulk_server <port> <bulk_size>\n";
-    return 1;
+    const auto err = std::string("bind failed: ") + std::strerror(errno);
+    close_listener();
+    throw std::runtime_error(err);
   }
 
-  try
+  if (::listen(listener_, kBacklog) < 0)
   {
-    const auto port = static_cast<unsigned short>(std::stoul(argv[1]));
-    const auto bulk_size = static_cast<std::size_t>(std::stoul(argv[2]));
-
-    boost::asio::io_context io;
-    Server srv(io, port, bulk_size);
-    io.run();
+    const auto err = std::string("listen failed: ") + std::strerror(errno);
+    close_listener();
+    throw std::runtime_error(err);
   }
-  catch (const std::exception &e)
-  {
-    std::cerr << "Error: " << e.what() << "\n";
-    return 2;
-  }
-  return 0;
 }
 
+TcpServer::~TcpServer()
+{
+  close_listener();
+}
 
+void TcpServer::close_listener()
+{
+  if (listener_ >= 0)
+  {
+    ::close(listener_);
+    listener_ = -1;
+  }
+}
+
+void TcpServer::run()
+{
+  std::cout << "join_server listening on port " << port_ << std::endl;
+  for (;;)
+  {
+    sockaddr_in client_addr{};
+    socklen_t client_len = sizeof(client_addr);
+    int client_fd = ::accept(listener_, reinterpret_cast<sockaddr *>(&client_addr), &client_len);
+    if (client_fd < 0)
+    {
+      if (errno == EINTR)
+        continue;
+      std::cerr << "accept failed: " << std::strerror(errno) << std::endl;
+      break;
+    }
+
+    std::thread(&TcpServer::handle_client, this, client_fd).detach();
+  }
+}
+
+bool TcpServer::send_all(int client_fd, const std::string &data)
+{
+  std::size_t total_sent = 0;
+  const char *buffer = data.data();
+  const std::size_t size = data.size();
+
+  while (total_sent < size)
+  {
+    const ssize_t sent = ::send(client_fd, buffer + total_sent, size - total_sent, 0);
+    if (sent < 0)
+    {
+      if (errno == EINTR)
+        continue;
+      std::cerr << "send failed: " << std::strerror(errno) << std::endl;
+      return false;
+    }
+    total_sent += static_cast<std::size_t>(sent);
+  }
+  return true;
+}
+
+void TcpServer::handle_client(int client_fd)
+{
+  CommandProcessor processor(*store_);
+  std::string buffer;
+  buffer.reserve(kBufferSize);
+  char chunk[kBufferSize];
+
+  bool running = true;
+  for (; running;)
+  {
+    const ssize_t received = ::recv(client_fd, chunk, sizeof(chunk), 0);
+    if (received == 0)
+      break; // connection closed
+
+    if (received < 0)
+    {
+      if (errno == EINTR)
+        continue;
+      std::cerr << "recv failed: " << std::strerror(errno) << std::endl;
+      break;
+    }
+
+    buffer.append(chunk, static_cast<std::size_t>(received));
+
+    std::size_t processed = 0;
+    while (true)
+    {
+      const auto newline_pos = buffer.find('\n', processed);
+      if (newline_pos == std::string::npos)
+      {
+        if (processed > 0)
+          buffer.erase(0, processed);
+        break;
+      }
+
+      std::string line = buffer.substr(processed, newline_pos - processed);
+      if (!line.empty() && line.back() == '\r')
+        line.pop_back();
+
+      processed = newline_pos + 1;
+
+      const auto result = processor.execute(line);
+      std::string response;
+      response.reserve(result.lines.size() * 8);
+      for (const auto &entry : result.lines)
+      {
+        response.append(entry);
+        response.push_back('\n');
+      }
+
+      if (!send_all(client_fd, response))
+      {
+        running = false;
+        break;
+      }
+    }
+  }
+
+  ::close(client_fd);
+}
+
+} // namespace join_server

@@ -1,43 +1,71 @@
-cmake_minimum_required(VERSION 3.12)
+cmake_minimum_required(VERSION 3.16)
 
-project(async VERSION 0.1.0 LANGUAGES CXX)
+project(join_server VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
 
 find_package(Threads REQUIRED)
 
-# Library
-add_library(async SHARED
-  source/async.cpp
-  source/dispatcher.cpp
+add_library(join_server_core
+    source/command.cpp
+    source/tables.cpp
 )
-target_include_directories(async PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(async PRIVATE Threads::Threads)
-set_target_properties(async PROPERTIES OUTPUT_NAME async)
 
-install(TARGETS async
-        LIBRARY DESTINATION lib
-        ARCHIVE DESTINATION lib
-        RUNTIME DESTINATION bin)
-install(FILES include/async/async.h DESTINATION include/async)
+target_include_directories(join_server_core
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
 
-add_executable(bulk source/main.cpp)
-target_link_libraries(bulk PRIVATE async)
-install(TARGETS bulk RUNTIME DESTINATION bin)
+add_library(join_server::core ALIAS join_server_core)
 
-add_executable(bulk_server source/server.cpp)
-target_link_libraries(bulk_server PRIVATE async Threads::Threads)
-install(TARGETS bulk_server RUNTIME DESTINATION bin)
+add_executable(join_server
+    source/main.cpp
+    source/server.cpp
+)
 
-set(CPACK_GENERATOR "DEB")
-set(CPACK_PACKAGE_NAME "async")
-set(CPACK_PACKAGE_VERSION_MAJOR ${PROJECT_VERSION_MAJOR})
-set(CPACK_PACKAGE_VERSION_MINOR ${PROJECT_VERSION_MINOR})
-set(CPACK_PACKAGE_VERSION_PATCH ${PROJECT_VERSION_PATCH})
-set(CPACK_DEBIAN_PACKAGE_MAINTAINER "Savchenko")
+set_target_properties(join_server PROPERTIES
+    OUTPUT_NAME join_server
+)
+
+target_link_libraries(join_server
+    PRIVATE
+        join_server::core
+        Threads::Threads
+)
+
+install(TARGETS join_server
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+
+option(JOIN_SERVER_BUILD_TESTS "Build join_server unit tests" ON)
+
+if(JOIN_SERVER_BUILD_TESTS)
+    enable_testing()
+
+    # Allow Conan-installed packages (generated in the build tree) to be discoverable.
+    list(APPEND CMAKE_PREFIX_PATH "${CMAKE_BINARY_DIR}")
+
+    find_package(GTest CONFIG REQUIRED)
+
+    add_executable(join_server_tests
+        tests/tables_tests.cpp
+        tests/command_tests.cpp
+    )
+
+    target_link_libraries(join_server_tests
+        PRIVATE
+            join_server::core
+            GTest::gtest_main
+            Threads::Threads
+    )
+
+    include(GoogleTest)
+    gtest_discover_tests(join_server_tests)
+endif()
 
 include(CPack)
-
-
-
